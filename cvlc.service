@@ -1,0 +1,14 @@
+[Unit]
+Description=cvlc
+After=syslog.target network-online.target sound.target
+
+[Service]
+User=ken
+ExecStart=/usr/bin/cvlc --no-video --gain 3 --play-and-exit http://192.168.0.111:5004/auto/v5.1?transcode=internet240
+#ExecStart=/usr/bin/cvlc --no-video --gain 5 --play-and-exit http://192.168.0.111:5004/auto/v5.1
+WorkingDirectory=/home/ken/
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
