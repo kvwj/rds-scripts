@@ -1,0 +1,13 @@
+[Unit]
+Description=songname
+After=syslog.target network-online.target
+
+[Service]
+User=ken
+ExecStart=/home/ken/scripts/zara_songname_to_rds.sh
+WorkingDirectory=/home/ken/scripts
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
