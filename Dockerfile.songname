@@ -1,0 +1,11 @@
+FROM alpine
+
+RUN apk update && apk add bash && apk add cifs-utils && apk add curl
+
+RUN mkdir /opt/app
+
+COPY zara_songname_to_rds.sh /opt/app/
+
+RUN chmod +x /opt/app/zara_songname_to_rds.sh
+
+ENTRYPOINT ["bin/bash", "/opt/app/zara_songname_to_rds.sh"]
