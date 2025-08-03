@@ -1,6 +1,8 @@
 FROM alpine
 
-RUN apk update && apk add bash && apk add cifs-utils && apk add curl
+RUN apk update && apk add bash && apk add cifs-utils && apk add curl && apk add tzdata
+
+ENV TZ="America/Denver"
 
 RUN mkdir /opt/app
 
