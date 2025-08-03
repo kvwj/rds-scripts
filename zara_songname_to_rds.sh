@@ -12,54 +12,54 @@ DELIMITER=' - '
 while true; do
   sleep 1
   NEW=`ls -l "$FILE"`
-  if [[ $(date +%u) -eq 7 ]]; then
-    #echo "Today is Sunday!"
-    SONGNAME=$(</mnt/zara/ZaraLogs/CurrentSong.txt)
-    NAMELENGTH=${#SONGNAME}
-    if [ "$NAMELENGTH" -gt 64 ]; then
-      SONGNAMECUT=$(echo $SONGNAME | cut -c 1-64)
-      echo "TEXT=$(echo $SONGNAMECUT )"|nc -i 2 -w 2 192.168.0.108 7005
-      echo "TEXT?"|nc -i 2 -w 2 192.168.0.108 7005
-    fi
-    if [ "$NAMELENGTH" -lt 65 ]; then
-      echo "TEXT=$(echo $SONGNAME )"|nc -i 2 -w 2 192.168.0.108 7005
-      echo "TEXT?"|nc -i 2 -w 2 192.168.0.108 7005
-    fi
-  fi
-  if [[ $(date +%u) -ne 7 ]]; then
-    #echo "Today is not Sunday."
-    if [ "$NEW" != "$LAST" ]; then
+  if [ "$NEW" != "$LAST" ]; then
+    if [[ $(date +%u) -eq 7 ]]; then
+      #echo "Today is Sunday!"
       SONGNAME=$(</mnt/zara/ZaraLogs/CurrentSong.txt)
-      DELCOUNT=$(echo "$SONGNAME" | grep -o "$DELIMITER" | wc -l)
-      if [ "$DELCOUNT" -gt 1 ]; then
-        NAMELENGTH=${#SONGNAME}
-        if [ "$NAMELENGTH" -gt 64 ]; then
-          SONGNAMECUT=$(echo $SONGNAME | cut -c 1-64)
-          echo "TEXT=$(echo $SONGNAMECUT )"|nc -i 2 -w 2 192.168.0.108 7005
-          echo "TEXT?"|nc -i 2 -w 2 192.168.0.108 7005
-        fi
-        if [ "$NAMELENGTH" -lt 65 ]; then
-          echo "TEXT=$(echo $SONGNAME )"|nc -i 2 -w 2 192.168.0.108 7005
-          echo "TEXT?"|nc -i 2 -w 2 192.168.0.108 7005
-        fi
+      NAMELENGTH=${#SONGNAME}
+      if [ "$NAMELENGTH" -gt 64 ]; then
+        SONGNAMECUT=$(echo $SONGNAME | cut -c 1-64)
+        echo "TEXT=$(echo $SONGNAMECUT )"|nc -i 2 -w 2 192.168.0.108 7005
+        echo "TEXT?"|nc -i 2 -w 2 192.168.0.108 7005
       fi
-      if [ "$SONGNAME" = "Hyrum City Civics Night" ]; then
+      if [ "$NAMELENGTH" -lt 65 ]; then
         echo "TEXT=$(echo $SONGNAME )"|nc -i 2 -w 2 192.168.0.108 7005
-      fi
-      if [ "$SONGNAME" = "The Magic of Christmas" ]; then
-        echo "TEXT=The Magic of Christmas"|nc -i 2 -w 2 192.168.0.108 7005
-      fi
-      if [ "$SONGNAME" = "Hyrum City Patriotic Program" ]; then
-        echo "TEXT=Hyrum City Patriotic Program"|nc -i 2 -w 2 192.168.0.108 7005
-      fi
-      if [[ "$SONGNAME" == *"FSN"* ]]; then
-        echo "TEXT=FSN World News"|nc -i 2 -w 2 192.168.0.108 7005
-      fi
-      if [[ "$SONGNAME" == *"Big Time 80"* ]]; then
-        echo "TEXT=Big Time 80s with Gary Teel"|nc -i 2 -w 2 192.168.0.108 7005
+        echo "TEXT?"|nc -i 2 -w 2 192.168.0.108 7005
       fi
     fi
-   fi
+    if [[ $(date +%u) -ne 7 ]]; then
+      #echo "Today is not Sunday."
+        SONGNAME=$(</mnt/zara/ZaraLogs/CurrentSong.txt)
+        DELCOUNT=$(echo "$SONGNAME" | grep -o "$DELIMITER" | wc -l)
+        if [ "$DELCOUNT" -gt 1 ]; then    
+          NAMELENGTH=${#SONGNAME}
+          if [ "$NAMELENGTH" -gt 64 ]; then
+            SONGNAMECUT=$(echo $SONGNAME | cut -c 1-64)
+            echo "TEXT=$(echo $SONGNAMECUT )"|nc -i 2 -w 2 192.168.0.108 7005
+            echo "TEXT?"|nc -i 2 -w 2 192.168.0.108 7005
+          fi
+          if [ "$NAMELENGTH" -lt 65 ]; then
+            echo "TEXT=$(echo $SONGNAME )"|nc -i 2 -w 2 192.168.0.108 7005
+            echo "TEXT?"|nc -i 2 -w 2 192.168.0.108 7005
+          fi
+        fi
+        if [ "$SONGNAME" = "Hyrum City Civics Night" ]; then
+          echo "TEXT=$(echo $SONGNAME )"|nc -i 2 -w 2 192.168.0.108 7005
+        fi
+        if [ "$SONGNAME" = "The Magic of Christmas" ]; then
+          echo "TEXT=The Magic of Christmas"|nc -i 2 -w 2 192.168.0.108 7005
+        fi
+        if [ "$SONGNAME" = "Hyrum City Patriotic Program" ]; then
+          echo "TEXT=Hyrum City Patriotic Program"|nc -i 2 -w 2 192.168.0.108 7005
+        fi
+        if [[ "$SONGNAME" == *"FSN"* ]]; then
+          echo "TEXT=FSN World News"|nc -i 2 -w 2 192.168.0.108 7005
+        fi
+        if [[ "$SONGNAME" == *"Big Time 80"* ]]; then
+          echo "TEXT=Big Time 80s with Gary Teel"|nc -i 2 -w 2 192.168.0.108 7005
+        fi
+    fi
 #    echo "DPS=$(</mnt/zara/ZaraLogs/CurrentSong.txt )"|nc -w 2 192.168.0.108 7005
     LAST="$NEW"
+  fi
 done
