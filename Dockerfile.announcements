@@ -1,0 +1,19 @@
+FROM python:3-slim
+
+ENV TZ=America/Denver
+
+COPY requirements.txt /opt/app/requirements.txt
+
+COPY server.py /opt/app/server.py
+
+COPY start.sh /opt/app/start.sh
+
+RUN chmod +x /opt/app/start.sh
+
+WORKDIR /opt/app
+
+RUN apt update && apt upgrade && apt -y install cifs-utils tzdata
+
+RUN pip install -r requirements.txt
+
+ENTRYPOINT ["/bin/bash", "/opt/app/start.sh"]
