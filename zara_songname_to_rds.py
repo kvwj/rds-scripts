@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+import os
+import time
+import socket
+import logging
+import psycopg2
+
+def get_env_value(env_variable):
+    try:
+        return os.environ[env_variable]
+    except KeyError:
+        error_msg = 'Set the {} environment variable'.format(env_variable)
+        #raise ImproperlyConfigured(error_msg)
+
+#FILE = "/mnt/zara/ZaraLogs/CurrentSong.txt"
+#RDS_HOST = "192.168.0.108
+#RDS_PORT = 7005
+MAX_LEN = 64
+#DB_HOST = '127.0.0.1'
+DB_HOST = get_env_value('DB_HOST')
+DB_NAME = get_env_value('DB_NAME')
+DB_USER = get_env_value('DB_USER')
+DB_PASSWORD = get_env_value('DB_PASSWORD')
+RDS_HOST = get_env_value('RDS_HOST')
+RDS_PORT = get_env_value('RDS_PORT')
+ROTATE_SECONDS = int(get_env_value('ROTATE_SECONDS'))
+CURRENT_SONG_FILE = get_env_value('CURRENT_SONG_FILE')
+
+DB_CONFIG = {
+    "host": DB_HOST,
+    "port": 5432,
+    "dbname": DB_NAME,
+    "user": DB_USER,
+    "password": DB_PASSWORD,
+}
+
+SPECIAL_CASES = {
+    "FSN": "FSN World News",
+    "The Magic of Christmas": "The Magic of Christmas",
+    "Hyrum City Patriotic Program": "Hyrum City Patriotic Program",
+    "Hyrum City Civics Night": "Hyrum City Civics Night",
+}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+def safe_trim(text: str, max_len: int = MAX_LEN) -> str:
+    return text[:max_len]
+
+def send_rds_command(command: str) -> None:
+    with socket.create_connection((RDS_HOST, RDS_PORT), timeout=2) as sock:
+        sock.sendall((command + "\n").encode("utf-8"))
+
+
+def send_rds_text(text: str) -> None:
+    text = safe_trim(text)
+    send_rds_command(f"TEXT={text}")
+    send_rds_command("TEXT?")
+
+def connect_db():
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    return conn
+
+def read_stable_file(path: str, checks: int = 2, delay: float = 0.2) -> str | None:
+    previous = None
+    stable_count = 0
+
+    for _ in range(20):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                current = f.read().strip().replace("\x00", "")
+        except FileNotFoundError:
+            return None
+
+        if current and current == previous:
+            stable_count += 1
+            if stable_count >= checks:
+                return current
+        else:
+            stable_count = 0
+            previous = current
+
+        time.sleep(delay)
+
+    return previous if previous else None
+
+def lookup_display_text(conn, songname: str) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT CONCAT_WS(
+                ' - ',
+                COALESCE(NULLIF(t.track_display_name, ''), NULLIF(t.track_name, '')),
+                COALESCE(NULLIF(a.artist_display_name, ''), NULLIF(a.artist_name, '')),
+                NULLIF(y.year::text, '')
+            )
+            FROM tracks t
+            LEFT JOIN artists a
+              ON a.id = t.artistid
+            LEFT JOIN years y
+              ON y.id = t.yearid
+            WHERE t.filename = %s 
+            LIMIT 1
+            """,
+            (songname,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+def lookup_category(conn, filename: str) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.category
+            FROM categories c
+            JOIN tracks t ON t.categoryid = c.id
+            WHERE t.filename = %s
+            LIMIT 1
+            """,
+            (filename + '.mp3',),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+def file_changed(path: str, last_mtime: float | None) -> tuple[bool, float | None]:
+    try:
+        current_mtime = os.path.getmtime(path)
+    except FileNotFoundError:
+        return False, last_mtime
+
+    if last_mtime is None:
+        return False, current_mtime
+
+    if current_mtime != last_mtime:
+        return True, current_mtime
+
+    return False, current_mtime
+
+def resolve_song_text(conn, filename: str) -> str:
+    for needle, replacement in SPECIAL_CASES.items():
+        if needle in filename:
+            return replacement
+    if filename is not None:
+        filename = filename.replace("\x00", "")
+        try:
+            db_text = lookup_display_text(conn, filename + '.mp3')
+        except:
+            logging.warning("DB Text lookup failed looking for: %s", filename + '.mp3')
+            return None
+        if db_text:
+            return db_text
+
+    return None
+
+def main():
+    conn = connect_db()
+
+    last_mtime = None
+    current_songname = None
+    current_song_text = None
+    last_sent_text = None
+
+    rotation_epoch = time.monotonic()
+    force_send_song_now = False
+
+    try:
+        while True:
+            changed, last_mtime = file_changed(CURRENT_SONG_FILE, last_mtime)
+
+            if changed:
+                current_song_category = None
+                that_80s_show = False
+                a_category = False
+                b_category = False
+                c_category = False
+                d_category = False
+                e_category = False
+                f_category = False
+                g_category = False
+                songname = read_stable_file(CURRENT_SONG_FILE)
+                if songname:
+                    current_songname = songname
+                    current_song_text = resolve_song_text(conn, songname)
+                    try:
+                        if current_song_text:
+                            current_song_category = lookup_category(conn, songname)    
+                    except:
+                        current_song_text = None
+                    try:
+                        if current_song_category:
+                            if '80s' in current_song_category:
+                                that_80s_show = True
+                            if 'A power oldie' in current_song_category:
+                                a_category = True
+                            if 'B medium oldie' in current_song_category:
+                                b_category = True
+                            if 'C slow oldie' in current_song_category:
+                                c_category = True
+                            if 'D extra slow oldie' in current_song_category:
+                                d_category = True
+                            if 'E beatles-beachboys-elvis' in current_song_category:
+                                e_category = True
+                            if 'F image track' in current_song_category:
+                                f_category = True
+                            if 'G golden oldie' in current_song_category:
+                                g_category = True
+                    except:
+                        current_song_category = None
+                    rotation_epoch = time.monotonic()
+                    force_send_song_now = True
+                    logging.info("Detected new song: %s", current_songname)
+                    logging.info("Song category: %s", current_song_category)
+                    logging.info("Resolved display text: %s", current_song_text)
+            if current_song_text:
+                if force_send_song_now:
+                    text_to_send = current_song_text
+                    force_send_song_now = False
+                if that_80s_show:
+                    PROGRAM_TEXT = "That 80s Show"
+                    elapsed = time.monotonic() - rotation_epoch
+                    slot = int(elapsed // ROTATE_SECONDS)
+
+                    if slot % 2 == 0:
+                        text_to_send = current_song_text
+                    else:
+                        text_to_send = PROGRAM_TEXT
+                # if a_category:
+                #     PROGRAM_TEXT = "A Power Oldie on KVWJ"
+                #     elapsed = time.monotonic() - rotation_epoch
+                #     slot = int(elapsed // ROTATE_SECONDS)
+
+                #     if slot % 2 == 0:
+                #         text_to_send = current_song_text
+                #     else:
+                #         text_to_send = PROGRAM_TEXT
+
+                # if f_category:
+                #     PROGRAM_TEXT = "An Image Track on KVWJ"
+                #     elapsed = time.monotonic() - rotation_epoch
+                #     slot = int(elapsed // ROTATE_SECONDS)
+
+                #     if slot % 2 == 0:
+                #         text_to_send = current_song_text
+                #     else:
+                #         text_to_send = PROGRAM_TEXT
+
+                # if g_category:
+                #     PROGRAM_TEXT = "A Golden Oldie on KVWJ"
+                #     elapsed = time.monotonic() - rotation_epoch
+                #     slot = int(elapsed // ROTATE_SECONDS)
+
+                #     if slot % 2 == 0:
+                #         text_to_send = current_song_text
+                #     else:
+                #         text_to_send = PROGRAM_TEXT
+
+                # text_to_send = safe_trim(text_to_send)
+
+                if text_to_send != last_sent_text:
+                    send_rds_text(text_to_send)
+                    last_sent_text = text_to_send
+                    logging.info("Sent to RDS: %s", text_to_send)
+
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        logging.info("Exiting on keyboard interrupt")
+    except psycopg2.Error as e:
+        logging.exception("Database error: %s", e)
+    except Exception as e:
+        logging.exception("Unhandled error: %s", e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
