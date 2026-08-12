@@ -28,6 +28,7 @@ class LogHandler(FileSystemEventHandler):
     def __init__(self):
         self.startup_complete = False
         self.db_lock = threading.Lock()
+        self.file_state = {}
 
     def rds_send(self, host, port, content):
         try:
@@ -65,43 +66,73 @@ class LogHandler(FileSystemEventHandler):
         finally:
             s.close()
 
-    def process_log_file(self, filepath):
-        date = os.path.basename(filepath).split('.log')[0]
+    def process_log_file(self, filepath, read_existing=False):
+        date = os.path.basename(filepath).split(".log")[0]
+
         try:
-            filedate = datetime.strptime(date, '%Y-%m-%d')
+            filedate = datetime.strptime(date, "%Y-%m-%d")
         except ValueError:
             return
-        
+
         fourweeksago = datetime.now() - timedelta(days=29)
-        fourweeksago_str = fourweeksago.strftime('%Y-%m-%d')
+
         if filedate <= fourweeksago:
             return
-        
-        # Delete old records
+
         try:
-            cur.execute("DELETE FROM playback WHERE date < %s", (fourweeksago_str,))
-            con.commit()
-        except Exception as e:
-            print('Not deleting old records:', e)
-        
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as log:
-                log_contents = log.readlines()
-        except Exception as e:
-            print(f'Error reading {filepath}:', e)
+            stat = os.stat(filepath)
+        except FileNotFoundError:
             return
-        
-        i = 1
-        for line in log_contents:
-            try:
-                self.parse_and_insert(line, date, i)
-                i += 1
-            except Exception as e:
-                #print(f'Skipping line {i} in {date}:', e)
-                #print('Line contents: ', line)
-                pass
-        
-        print(f'Processed log file: {filepath}')
+
+        state = self.file_state.get(filepath)
+
+        # Read from the beginning when:
+        # - This is initial startup processing.
+        # - This is a newly observed file.
+        # - The file was rotated/replaced (inode changed).
+        # - The file was truncated.
+        if (
+            read_existing
+            or state is None
+            or state["inode"] != stat.st_ino
+            or stat.st_size < state["offset"]
+        ):
+            offset = 0
+        else:
+            offset = state["offset"]
+
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as log:
+                log.seek(offset)
+                new_lines = log.readlines()
+                new_offset = log.tell()
+
+        except Exception as e:
+            print(f"Error reading {filepath}: {e}")
+            return
+
+        self.file_state[filepath] = {
+            "inode": stat.st_ino,
+            "offset": new_offset,
+        }
+
+        if not new_lines:
+            return
+
+        print(
+            f"Processing {len(new_lines)} new line(s) from "
+            f"{filepath}, starting at byte offset {offset}"
+        )
+
+        with self.db_lock:
+            for line in new_lines:
+                try:
+                    self.parse_and_insert(line, date, None)
+                except Exception as e:
+                    print(f"Error processing new log line in {filepath}: {e}")
+                    con.rollback()
+
+        print(f"Finished processing new entries in: {filepath}")
 
     def parse_and_insert(self, line, date, line_num):
         paths = [
@@ -176,7 +207,8 @@ class LogHandler(FileSystemEventHandler):
                         cur.execute("""
                             SELECT id FROM tracks WHERE track_name = %s AND artistid IS NULL""",(song_name,))
                         trackid = cur.fetchone()
-                    except Exception as e:
+                    except psycopg2.Error as e:
+                        con.rollback()
                         print('Could not insert song ', song_name, ' into tracks\n', e)
                 cur.execute("""
                     SELECT filename FROM tracks WHERE track_name = %s AND artistid IS NULL""",(song_name,))
@@ -194,12 +226,25 @@ class LogHandler(FileSystemEventHandler):
                     cur.execute("""
                         INSERT INTO playback (trackid, date, timestamp)
                         VALUES (%s, %s, %s)
+                        ON CONFLICT DO NOTHING
+                        RETURNING id
                     """, (trackid[0], date, timestamp))
+
+                    playback_row = cur.fetchone()
+                    con.commit()
+
+                    if playback_row:
+                        print(f"Inserted playback.id={playback_row[0]}")
+                    else:
+                        print(
+                            f"Playback already exists; skipped: "
+                            f"trackid={trackid[0]}, date={date}, timestamp={timestamp}"
+                        )
                     print('Adding Sunday song play', song_category, song_name, date, timestamp)
                     self.song_name = song_name
-                except Exception as e:
-                    print(e)
-                    pass
+                except psycopg2.Error as e:
+                    con.rollback()
+                    print(f"Database error: {e}")
                 # try:
                 #     rds_text = f"TEXT={song_name} - {song_artist} - {song_year}" 
                 #     rds_send('192.168.0.108', 7005, rds_text)
@@ -233,7 +278,8 @@ class LogHandler(FileSystemEventHandler):
                         cur.execute("""
                             SELECT id FROM artists WHERE UPPER(artist_name) = %s""",(song_artist.upper(),))
                         artistid = cur.fetchone()
-                    except Exception as e:
+                    except psycopg2.Error as e:
+                        con.rollback()
                         print('Error inserting artist ', song_artist, e)
                         import sys
                         print(f"EXCEPTION LINE: {sys.exc_info()[2].tb_lineno}")
@@ -256,7 +302,8 @@ class LogHandler(FileSystemEventHandler):
                         cur.execute("""
                                     SELECT id FROM categories where category = %s""", (song_category,))
                         categoryid = cur.fetchone()
-                    except Exception as e:
+                    except psycopg2.Error as e:
+                        con.rollback()
                         print('Error inserting category ', song_category, e)
                         import sys
                         print(f"EXCEPTION LINE: {sys.exc_info()[2].tb_lineno}")
@@ -281,7 +328,8 @@ class LogHandler(FileSystemEventHandler):
                         cur.execute("""
                             SELECT id FROM tracks WHERE track_name = %s AND artistid = %s""",(song_name,artistid[0]))
                         trackid = cur.fetchone()
-                    except Exception as e:
+                    except psycopg2.Error as e:
+                        con.rollback()
                         print('Could not insert ', song_name, ' by ', song_artist, ' into tracks table.\n',e)
                 cur.execute("""
                     SELECT filename FROM tracks WHERE track_name = %s AND artistid = %s""",(song_name,artistid[0]))
@@ -299,12 +347,25 @@ class LogHandler(FileSystemEventHandler):
                     cur.execute("""
                         INSERT INTO playback (trackid, date, timestamp)
                         VALUES (%s, %s, %s)
+                        ON CONFLICT DO NOTHING
+                        RETURNING id
                     """, (trackid[0], date, timestamp))
+
+                    playback_row = cur.fetchone()
+                    con.commit()
+
+                    if playback_row:
+                        print(f"Inserted playback.id={playback_row[0]}")
+                    else:
+                        print(
+                            f"Playback already exists; skipped: "
+                            f"trackid={trackid[0]}, date={date}, timestamp={timestamp}"
+                        )
                     print('Adding That 80s Show song play', song_category, song_name, date, timestamp)
                     self.song_name = song_name
-                except Exception as e:
-                    print(e)
-                    pass
+                except psycopg2.Error as e:
+                    con.rollback()
+                    print(f"Database error: {e}")
             else:
                 song_detail = song_info_split[2].strip().split(' - ')
                 #print('Song detail is: ', song_detail)
@@ -338,7 +399,8 @@ class LogHandler(FileSystemEventHandler):
                                                 VALUES (%s)
                                             """,(year_int,))
                                 con.commit()
-                            except Exception as e:
+                            except psycopg2.Error as e:
+                                con.rollback()
                                 print('Could not insert ', song_year, ' into years table.\n',e)
                             cur.execute("""
                                         SELECT id FROM years WHERE year = %s""", (song_year,))
@@ -379,7 +441,8 @@ class LogHandler(FileSystemEventHandler):
                             cur.execute("""
                                 SELECT id FROM artists WHERE UPPER(artist_name) = %s""",(song_artist.upper(),))
                             artistid = cur.fetchone()
-                        except Exception as e:
+                        except psycopg2.Error as e:
+                            con.rollback()
                             print('Error inserting artist ', song_artist, e)
                             import sys
                             print(f"EXCEPTION LINE: {sys.exc_info()[2].tb_lineno}")
@@ -406,7 +469,8 @@ class LogHandler(FileSystemEventHandler):
                                 cur.execute("""
                                             SELECT id FROM tracks WHERE track_name = %s AND categoryid = %s AND artistid = %s""",(song_name,categoryid[0],artistid[0]))
                                 trackid = cur.fetchone()
-                            except Exception as e:
+                            except psycopg2.Error as e:
+                                con.rollback()
                                 print('Could not insert ', song_name, ' by ', song_artist, ' into tracks table.\n',e)
                         try:
                             cur.execute("""
@@ -418,7 +482,8 @@ class LogHandler(FileSystemEventHandler):
                             cur.execute("""
                                         SELECT id FROM tracks WHERE track_name = %s AND categoryid = %s AND yearid = %s AND artistid = %s""",(song_name,categoryid[0],yearid[0],artistid[0]))
                             trackid = cur.fetchone()
-                        except Exception as e:
+                        except psycopg2.Error as e:
+                            con.rollback()
                             print('Could not insert ', song_name, ' by ', song_artist, ' from ', song_year, ' in ', song_category, ' into tracks table.\n',e)
                     cur.execute("""
                         SELECT filename FROM tracks WHERE track_name = %s AND artistid = %s""",(song_name,artistid[0]))
@@ -437,13 +502,25 @@ class LogHandler(FileSystemEventHandler):
                         cur.execute("""
                             INSERT INTO playback (trackid, date, timestamp)
                             VALUES (%s, %s, %s)
+                            ON CONFLICT DO NOTHING
+                            RETURNING id
                         """, (trackid[0], date, timestamp))
+                        playback_row = cur.fetchone()
+                        con.commit()
+
+                        if playback_row:
+                            print(f"Inserted playback.id={playback_row[0]}")
+                        else:
+                            print(
+                                f"Playback already exists; skipped: "
+                                f"trackid={trackid[0]}, date={date}, timestamp={timestamp}"
+                            )
                         self.song_name = song_name
                         self.song_artist = song_artist
                         self.song_year = song_year
-                    except Exception as e:
-                        #print(e)
-                        pass
+                    except psycopg2.Error as e:
+                        con.rollback()
+                        print(f"Database error: {e}")
                     # try:
                     #     rds_send('192.168.0.108', 7005, 'TEXT=', song_name, ' - ', song_artist, ' - ', song_year )
                     #     rds_send('192.168.0.108', 7005, 'TEXT=?')
@@ -460,25 +537,20 @@ class LogHandler(FileSystemEventHandler):
             print('Song name', song_name)
 
     def on_created(self, event):
-        if not event.is_directory and event.src_path != os.path.join(directory, 'CurrentSong.txt'):
+        if (
+            not event.is_directory
+            and event.src_path != os.path.join(directory, "CurrentSong.txt")
+        ):
             time.sleep(1)
-            self.process_log_file(event.src_path)
+            self.process_log_file(event.src_path, read_existing=False)
 
     def on_modified(self, event):
-        if not event.is_directory and event.src_path != os.path.join(directory, 'CurrentSong.txt'):
+        if (
+            not event.is_directory
+            and event.src_path != os.path.join(directory, "CurrentSong.txt")
+        ):
             time.sleep(2)
-            self.process_log_file(event.src_path)
-            #try:
-            #    if self.song_artist is not None and self.song_year is not None:
-            #        rds_text = f"TEXT={self.song_name} - {self.song_artist} - {self.song_year}"
-            #    if self.song_artist is not None and self.song_year is None:
-            #        rds_text = f"TEXT={self.song_name} - {self.song_artist}"
-            #    if self.song_artist is None and self.song_year is None:
-            #        rds_text = f"TEXT={self.song_name}"
-            #    self.rds_send('192.168.0.108', 7005, rds_text)
-            #    self.rds_send('192.168.0.108', 7005, 'TEXT?')
-            #except Exception as e:
-            #    print(e)
+            self.process_log_file(event.src_path, read_existing=False)
 
 # Process existing files on startup
 handler = LogHandler()
@@ -495,7 +567,7 @@ for filename in os.scandir(directory):
     if filedate >= fourweeksago:
         process = True
     if filename.is_file() and process == True and filename.name != 'CurrentSong.txt':
-        handler.process_log_file(filename.path)
+        handler.process_log_file(filename.path, read_existing=True)
     if process == False:
         print('Not processing ', filename.path)
 handler.startup_complete = True
