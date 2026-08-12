@@ -59,6 +59,12 @@ def send_rds_text(text: str) -> None:
     send_rds_command(f"TEXT={text}")
     send_rds_command("TEXT?")
 
+def write_now_playing(text: str) -> None:
+    text = safe_trim(text)
+    with open('now-playing.txt', "w", encoding="utf-8", errors="replace") as np:
+        np.write(text)
+        np.close()
+
 def connect_db():
     conn = psycopg2.connect(**DB_CONFIG)
     conn.autocommit = True
@@ -72,6 +78,7 @@ def read_stable_file(path: str, checks: int = 2, delay: float = 0.2) -> str | No
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 current = f.read().strip().replace("\x00", "")
+                print('CurrentSong.txt contents:', current)
         except FileNotFoundError:
             return None
 
@@ -87,43 +94,51 @@ def read_stable_file(path: str, checks: int = 2, delay: float = 0.2) -> str | No
 
     return previous if previous else None
 
-def lookup_display_text(conn, songname: str) -> str | None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT CONCAT_WS(
-                ' - ',
-                COALESCE(NULLIF(t.track_display_name, ''), NULLIF(t.track_name, '')),
-                COALESCE(NULLIF(a.artist_display_name, ''), NULLIF(a.artist_name, '')),
-                NULLIF(y.year::text, '')
-            )
-            FROM tracks t
-            LEFT JOIN artists a
-              ON a.id = t.artistid
-            LEFT JOIN years y
-              ON y.id = t.yearid
-            WHERE t.filename = %s 
-            LIMIT 1
-            """,
-            (songname,),
+def lookup_display_text(conn, songname: str) -> str | None:    
+    sql = """
+        SELECT CONCAT_WS(
+            ' - ',
+            COALESCE(NULLIF(t.track_display_name, ''), NULLIF(t.track_name, '')),
+            COALESCE(NULLIF(a.artist_display_name, ''), NULLIF(a.artist_name, '')),
+            NULLIF(y.year::text, '')
         )
+        FROM tracks t
+        LEFT JOIN artists a
+            ON a.id = t.artistid
+        LEFT JOIN years y
+            ON y.id = t.yearid
+        WHERE t.filename = %s 
+        LIMIT 1
+        """
+    with conn.cursor() as cur:
+        debug_sql = cur.mogrify(sql, (songname,)).decode("utf-8", errors="replace")
+        logging.info("lookup_display_text songname raw=%r", songname)
+        logging.info("lookup_display_text SQL=%s", debug_sql)
+        cur.execute(sql, (songname,))
         row = cur.fetchone()
-        return row[0] if row else None
+
+        logging.info("lookup_display_text row=%r", row)
+
+        return row[0] if row and row[0] else None
 
 def lookup_category(conn, filename: str) -> str | None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
+    sql =   """
             SELECT c.category
             FROM categories c
             JOIN tracks t ON t.categoryid = c.id
             WHERE t.filename = %s
             LIMIT 1
-            """,
-            (filename + '.mp3',),
-        )
+            """
+    with conn.cursor() as cur:
+        debug_sql = cur.mogrify(sql, (filename + '.mp3',)).decode("utf-8", errors="replace")
+        logging.info("lookup_category songname raw=%r", filename + '.mp3')
+        logging.info("lookup_category SQL=%s", debug_sql)
+        cur.execute(sql, (filename + '.mp3',))
         row = cur.fetchone()
-        return row[0] if row else None
+
+        logging.info("lookup_category row=%r", row)
+        
+        return row[0] if row and row[0] else None
 
 def file_changed(path: str, last_mtime: float | None) -> tuple[bool, float | None]:
     try:
@@ -144,12 +159,21 @@ def resolve_song_text(conn, filename: str) -> str:
         if needle in filename:
             return replacement
     if filename is not None:
-        filename = filename.replace("\x00", "")
+        filename = filename.replace("\x00", "").strip()
         try:
             db_text = lookup_display_text(conn, filename + '.mp3')
         except:
             logging.warning("DB Text lookup failed looking for: %s", filename + '.mp3')
             return None
+        if db_text:
+            return db_text
+        if db_text is None:
+            try:
+                logging.info("Performing additional DB Text lookup for: %s", filename + '.mp3')
+                db_text = lookup_display_text(conn, filename + '.mp3')
+            except:
+                logging.warning("DB Text lookup failed looking for: %s", filename + '.mp3')
+                return None
         if db_text:
             return db_text
 
@@ -189,6 +213,15 @@ def main():
                             current_song_category = lookup_category(conn, songname)    
                     except:
                         current_song_text = None
+                    if current_song_text is None:
+                        time.sleep(5)
+                        logging.info("Performing additional Resolve Text lookup for: %s", songname + '.mp3')
+                        current_song_text = resolve_song_text(conn, songname)
+                        try:
+                            if current_song_text:
+                                current_song_category = lookup_category(conn, songname)    
+                        except:
+                            current_song_text = None
                     try:
                         if current_song_category:
                             if '80s' in current_song_category:
@@ -225,6 +258,8 @@ def main():
 
                     if slot % 2 == 0:
                         text_to_send = current_song_text
+                    elif text_to_send is None:
+                        text_to_send = PROGRAM_TEXT
                     else:
                         text_to_send = PROGRAM_TEXT
                 # if a_category:
@@ -261,6 +296,7 @@ def main():
 
                 if text_to_send != last_sent_text:
                     send_rds_text(text_to_send)
+                    write_now_playing(text_to_send)
                     last_sent_text = text_to_send
                     logging.info("Sent to RDS: %s", text_to_send)
 
