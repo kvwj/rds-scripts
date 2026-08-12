@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import os
 import time
+import select
 import socket
 import logging
 import psycopg2
+import psycopg2.extensions
 
 def get_env_value(env_variable):
     try:
@@ -78,6 +80,326 @@ def read_stable_file(path: str, checks: int = 2, delay: float = 0.2) -> str | No
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 current = f.read().strip().replace("\x00", "")
+                #logging.info('CurrentSong.txt contents: %r', current)
+        except FileNotFoundError:
+            return None
+
+        if current and current == previous:
+            stable_count += 1
+            if stable_count >= checks:
+                return current
+        else:
+            stable_count = 0
+            previous = current
+
+        time.sleep(delay)
+
+    return previous if previous else None
+
+def resolve_special_case(current_song_text: str) -> str | None:
+    for needle, rds_text in SPECIAL_CASES.items():
+        if needle.casefold() in current_song_text.casefold():
+            return rds_text
+
+    return None
+
+def connect_listener():
+    conn = psycopg2.connect(**DB_CONFIG)
+
+    # LISTEN must not remain inside an uncommitted transaction.
+    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+
+    with conn.cursor() as cur:
+        cur.execute("LISTEN rds_playback;")
+
+    logging.info("Listening for PostgreSQL notifications on rds_playback")
+    return conn
+
+def lookup_display_text(conn, playback_id: int) -> str | None:
+    sql = """
+        SELECT CONCAT_WS(
+            ' - ',
+            COALESCE(NULLIF(t.track_display_name, ''), NULLIF(t.track_name, '')),
+            COALESCE(NULLIF(a.artist_display_name, ''), NULLIF(a.artist_name, '')),
+            NULLIF(y.year::text, '')
+        )
+        FROM playback p
+        JOIN tracks t
+          ON t.id = p.trackid
+        LEFT JOIN artists a
+          ON a.id = t.artistid
+        LEFT JOIN years y
+          ON y.id = t.yearid
+        WHERE p.id = %s
+        LIMIT 1
+    """
+
+    with conn.cursor() as cur:
+        logging.info("Looking up playback.id=%s", playback_id)
+        logging.debug(
+            "Playback query: %s",
+            cur.mogrify(sql, (playback_id,)).decode(
+                "utf-8",
+                errors="replace",
+            ),
+        )
+
+        cur.execute(sql, (playback_id,))
+        row = cur.fetchone()
+
+    logging.info("Playback lookup result: %r", row)
+    return row[0] if row and row[0] else None
+
+def lookup_category(conn, playback_id: int) -> str | None:
+    sql = """
+        SELECT c.category
+        FROM playback p
+        JOIN tracks t
+          ON t.id = p.trackid
+        LEFT JOIN categories c
+          ON c.id = t.categoryid
+        WHERE p.id = %s
+        LIMIT 1
+    """
+
+    with conn.cursor() as cur:
+        debug_sql = cur.mogrify(
+            sql,
+            (playback_id,),
+        ).decode("utf-8", errors="replace")
+
+        logging.info("lookup_category playback_id=%s", playback_id)
+        logging.debug("lookup_category SQL=%s", debug_sql)
+
+        cur.execute(sql, (playback_id,))
+        row = cur.fetchone()
+
+        logging.info("lookup_category row=%r", row)
+
+        return row[0] if row and row[0] else None
+
+def lookup_latest_playback_id(conn) -> int | None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id
+            FROM playback
+            ORDER BY id DESC
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+
+    return row[0] if row else None
+
+def process_notification(conn, notification) -> str | None:
+    logging.info(
+        "Received notification: channel=%s pid=%s playback_id=%r",
+        notification.channel,
+        notification.pid,
+        notification.payload,
+    )
+
+    try:
+        playback_id = int(notification.payload)
+    except (TypeError, ValueError):
+        logging.exception(
+            "Invalid playback ID payload received: %r",
+            notification.payload,
+        )
+        return None
+
+    return lookup_display_text(conn, playback_id), lookup_category(conn, playback_id)
+
+def main():
+    conn = connect_db()
+
+    listener_conn = None
+    current_songname = None
+    current_song_text = None
+    last_sent_text = None
+    latest_id = None
+    current_file_text = None
+    last_file_text = ''
+
+    rotation_epoch = time.monotonic()
+    force_send_song_now = False
+
+    if listener_conn is None or listener_conn.closed:
+        listener_conn = connect_listener()
+
+        latest_id = lookup_latest_playback_id(listener_conn)
+        current_song_text = lookup_display_text(
+            listener_conn,
+            latest_id,
+        )
+        current_song_category = lookup_category(
+            listener_conn,
+            latest_id,
+        )
+
+    send_rds_text(current_song_text)
+    last_sent_text = current_song_text
+    write_now_playing(current_song_text)
+    logging.info("Sent to RDS: %s", current_song_text)
+
+    try:
+        while True:
+            if listener_conn is None or listener_conn.closed:
+                listener_conn = connect_listener()
+                
+            if current_file_text != last_file_text:
+
+                current_file_text = read_stable_file(CURRENT_SONG_FILE)
+
+                if current_file_text:
+                    special_text = resolve_special_case(current_file_text)
+
+                    if special_text:
+                        logging.info(
+                            "Special Zara item detected: raw=%r resolved=%r",
+                            current_file_text,
+                            special_text,
+                        )
+
+                        current_file_text = special_text
+                        send_rds_text(current_file_text)
+                        write_now_playing(current_file_text)
+                        last_file_text = current_file_text
+                        logging.info("Sent to RDS: %s", current_file_text)
+
+            # Wait for a Postgres notification, up to one second.
+            ready, _, _ = select.select([listener_conn], [], [], 1)
+
+            if ready:
+                listener_conn.poll()
+
+                while listener_conn.notifies:
+                    current_song_category = None
+                    that_80s_show = False
+                    a_category = False
+                    b_category = False
+                    c_category = False
+                    d_category = False
+                    e_category = False
+                    f_category = False
+                    g_category = False
+                    notification = listener_conn.notifies.pop(0)
+                    current_song_text, current_song_category = process_notification(
+                        listener_conn,
+                        notification,
+                    )
+
+                    if not current_song_text:
+                        logging.warning(
+                            "No RDS text resolved for playback payload=%r",
+                            notification.payload,
+                        )
+                        continue
+
+                    try:
+                        if current_song_category:
+                            if '80s' in current_song_category:
+                                that_80s_show = True
+                            if 'A power oldie' in current_song_category:
+                                a_category = True
+                            if 'B medium oldie' in current_song_category:
+                                b_category = True
+                            if 'C slow oldie' in current_song_category:
+                                c_category = True
+                            if 'D extra slow oldie' in current_song_category:
+                                d_category = True
+                            if 'E beatles-beachboys-elvis' in current_song_category:
+                                e_category = True
+                            if 'F image track' in current_song_category:
+                                f_category = True
+                            if 'G golden oldie' in current_song_category:
+                                g_category = True
+                    except:
+                        current_song_category = None
+                    rotation_epoch = time.monotonic()
+                    force_send_song_now = True
+                    logging.info("Song category: %s", current_song_category)
+                    logging.info("Resolved display text: %s", current_song_text)
+                    if current_song_text:
+                        if force_send_song_now:
+                            text_to_send = current_song_text
+                            force_send_song_now = False
+                        if that_80s_show:
+                            PROGRAM_TEXT = "That 80s Show"
+                            elapsed = time.monotonic() - rotation_epoch
+                            slot = int(elapsed // ROTATE_SECONDS)
+
+                            if slot % 2 == 0:
+                                text_to_send = current_song_text
+                            elif text_to_send is None:
+                                text_to_send = PROGRAM_TEXT
+                            else:
+                                text_to_send = PROGRAM_TEXT
+                        # if a_category:
+                        #     PROGRAM_TEXT = "A Power Oldie on KVWJ"
+                        #     elapsed = time.monotonic() - rotation_epoch
+                        #     slot = int(elapsed // ROTATE_SECONDS)
+
+                        #     if slot % 2 == 0:
+                        #         text_to_send = current_song_text
+                        #     else:
+                        #         text_to_send = PROGRAM_TEXT
+
+                        # if f_category:
+                        #     PROGRAM_TEXT = "An Image Track on KVWJ"
+                        #     elapsed = time.monotonic() - rotation_epoch
+                        #     slot = int(elapsed // ROTATE_SECONDS)
+
+                        #     if slot % 2 == 0:
+                        #         text_to_send = current_song_text
+                        #     else:
+                        #         text_to_send = PROGRAM_TEXT
+
+                        # if g_category:
+                        #     PROGRAM_TEXT = "A Golden Oldie on KVWJ"
+                        #     elapsed = time.monotonic() - rotation_epoch
+                        #     slot = int(elapsed // ROTATE_SECONDS)
+
+                        #     if slot % 2 == 0:
+                        #         text_to_send = current_song_text
+                        #     else:
+                        #         text_to_send = PROGRAM_TEXT
+
+                        # text_to_send = safe_trim(text_to_send)
+
+                        if text_to_send != last_sent_text:
+                            send_rds_text(text_to_send)
+                            write_now_playing(text_to_send)
+                            last_sent_text = text_to_send
+                            logging.info("Sent to RDS: %s", text_to_send)
+
+    except KeyboardInterrupt:
+        logging.info("Exiting on keyboard interrupt")
+    except psycopg2.Error as e:
+        logging.exception("Database error: %s", e)
+    except psycopg2.OperationalError as exc:
+        logging.error("PostgreSQL listener connection error: %s", exc)
+
+        if listener_conn:
+            try:
+                listener_conn.close()
+            except Exception:
+                pass
+
+        listener_conn = None
+        time.sleep(5)
+
+    except Exception:
+        logging.exception("Unhandled RDS listener error")
+        time.sleep(2)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()                current = f.read().strip().replace("\x00", "")
                 print('CurrentSong.txt contents:', current)
         except FileNotFoundError:
             return None
