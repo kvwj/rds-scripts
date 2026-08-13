@@ -122,14 +122,7 @@ def resolve_file_override(raw_text: str) -> str | None:
     if not cleaned:
         return None
 
-    special_text = resolve_special_case(cleaned)
-
-    if special_text:
-        return special_text
-
-    # Your requested precedence rule:
-    # CurrentSong.txt always overrides database notifications.
-    return cleaned
+    return resolve_special_case(cleaned)
 
 def connect_listener():
     conn = psycopg2.connect(**DB_CONFIG)
@@ -283,42 +276,49 @@ def main():
 
             if file_was_changed:
                 raw_file_text = read_stable_file(CURRENT_SONG_FILE)
+                special_text = (
+                    resolve_file_override(raw_file_text)
+                    if raw_file_text
+                    else None
+                )
 
-                if raw_file_text:
-                    file_override_text = resolve_file_override(raw_file_text)
-                    active_rds_text = file_override_text
-                    rotation_epoch = time.monotonic()
+                if special_text:
+                    file_override_text = special_text
 
                     logging.info(
-                        "CurrentSong update: raw=%r override=%r",
+                        "Special CurrentSong override enabled: raw=%r resolved=%r",
                         raw_file_text,
                         file_override_text,
                     )
 
-                    if active_rds_text and active_rds_text != last_sent_text:
-                        send_rds_text(active_rds_text)
-                        write_now_playing(active_rds_text)
-                        last_sent_text = active_rds_text
+                    if file_override_text != last_sent_text:
+                        send_rds_text(file_override_text)
+                        write_now_playing(file_override_text)
+                        last_sent_text = file_override_text
 
                         logging.info(
-                            "Sent CurrentSong override to RDS: %s",
-                            active_rds_text,
+                            "Sent special CurrentSong override to RDS: %s",
+                            file_override_text,
                         )
 
-                else:
-                    # File was cleared or temporarily unavailable.
-                    # Remove the override and return to the database fallback.
-                    file_override_text = None
-                    active_rds_text = database_song_text
+                elif file_override_text:
+                    # The file changed away from a special item back to a normal song.
+                    # Remove the override and restore the most recent database text.
+                    logging.info(
+                        "Special CurrentSong override cleared: raw=%r",
+                        raw_file_text
+                    )
 
-                    if active_rds_text and active_rds_text != last_sent_text:
-                        send_rds_text(active_rds_text)
-                        write_now_playing(active_rds_text)
-                        last_sent_text = active_rds_text
+                    file_override_text = None
+
+                    if database_song_text and database_song_text != last_sent_text:
+                        send_rds_text(database_song_text)
+                        write_now_playing(database_song_text)
+                        last_sent_text = database_song_text
 
                         logging.info(
-                            "CurrentSong override cleared; database fallback restored: %s",
-                            active_rds_text,
+                            "Restored database RDS text: %s",
+                            database_song_text,
                         )
 
             # Wait for a Postgres notification, up to one second.
@@ -352,7 +352,7 @@ def main():
 
                     if file_override_text:
                         logging.info(
-                            "Database notification retained as fallback but not sent because "
+                            "Database RDS text not sent because special ooverride is active: "
                             "CurrentSong override is active: database=%r override=%r",
                             database_song_text,
                             file_override_text,
