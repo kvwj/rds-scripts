@@ -103,6 +103,34 @@ def resolve_special_case(current_song_text: str) -> str | None:
 
     return None
 
+def file_changed(path: str, last_mtime: float | None) -> tuple[bool, float | None]:
+    try:
+        current_mtime = os.path.getmtime(path)
+    except FileNotFoundError:
+        return False, last_mtime
+
+    # Treat initial startup as a file change.
+    if last_mtime is None:
+        return True, current_mtime
+
+    return current_mtime != last_mtime, current_mtime
+
+
+def resolve_file_override(raw_text: str) -> str | None:
+    cleaned = raw_text.replace("\x00", "").strip()
+
+    if not cleaned:
+        return None
+
+    special_text = resolve_special_case(cleaned)
+
+    if special_text:
+        return special_text
+
+    # Your requested precedence rule:
+    # CurrentSong.txt always overrides database notifications.
+    return cleaned
+
 def connect_listener():
     conn = psycopg2.connect(**DB_CONFIG)
 
@@ -190,7 +218,11 @@ def lookup_latest_playback_id(conn) -> int | None:
 
     return row[0] if row else None
 
-def process_notification(conn, notification) -> str | None:
+
+def process_notification(
+    conn,
+    notification,
+) -> tuple[str | None, str | None]:
     logging.info(
         "Received notification: channel=%s pid=%s playback_id=%r",
         notification.channel,
@@ -213,12 +245,13 @@ def main():
     conn = connect_db()
 
     listener_conn = None
-    current_songname = None
-    current_song_text = None
+    database_song_text = None
+    file_override_text = None
+    active_rds_text = None
     last_sent_text = None
+
     latest_id = None
-    current_file_text = None
-    last_file_text = ''
+    last_file_mtime = None
 
     rotation_epoch = time.monotonic()
     force_send_song_now = False
@@ -227,44 +260,66 @@ def main():
         listener_conn = connect_listener()
 
         latest_id = lookup_latest_playback_id(listener_conn)
-        current_song_text = lookup_display_text(
-            listener_conn,
-            latest_id,
-        )
-        current_song_category = lookup_category(
-            listener_conn,
-            latest_id,
-        )
 
-    send_rds_text(current_song_text)
-    last_sent_text = current_song_text
-    write_now_playing(current_song_text)
-    logging.info("Sent to RDS: %s", current_song_text)
+        if latest_id is not None:
+            database_song_text = lookup_display_text(
+                listener_conn,
+                latest_id,
+            )
+            current_song_category = lookup_category(
+                listener_conn,
+                latest_id,
+            )
 
     try:
         while True:
             if listener_conn is None or listener_conn.closed:
                 listener_conn = connect_listener()
                 
-            if current_file_text != last_file_text:
+            file_was_changed, last_file_mtime = file_changed(
+                CURRENT_SONG_FILE,
+                last_file_mtime,
+            )
 
-                current_file_text = read_stable_file(CURRENT_SONG_FILE)
+            if file_was_changed:
+                raw_file_text = read_stable_file(CURRENT_SONG_FILE)
 
-                if current_file_text:
-                    special_text = resolve_special_case(current_file_text)
+                if raw_file_text:
+                    file_override_text = resolve_file_override(raw_file_text)
+                    active_rds_text = file_override_text
+                    rotation_epoch = time.monotonic()
 
-                    if special_text:
+                    logging.info(
+                        "CurrentSong update: raw=%r override=%r",
+                        raw_file_text,
+                        file_override_text,
+                    )
+
+                    if active_rds_text and active_rds_text != last_sent_text:
+                        send_rds_text(active_rds_text)
+                        write_now_playing(active_rds_text)
+                        last_sent_text = active_rds_text
+
                         logging.info(
-                            "Special Zara item detected: raw=%r resolved=%r",
-                            current_file_text,
-                            special_text,
+                            "Sent CurrentSong override to RDS: %s",
+                            active_rds_text,
                         )
 
-                        current_file_text = special_text
-                        send_rds_text(current_file_text)
-                        write_now_playing(current_file_text)
-                        last_file_text = current_file_text
-                        logging.info("Sent to RDS: %s", current_file_text)
+                else:
+                    # File was cleared or temporarily unavailable.
+                    # Remove the override and return to the database fallback.
+                    file_override_text = None
+                    active_rds_text = database_song_text
+
+                    if active_rds_text and active_rds_text != last_sent_text:
+                        send_rds_text(active_rds_text)
+                        write_now_playing(active_rds_text)
+                        last_sent_text = active_rds_text
+
+                        logging.info(
+                            "CurrentSong override cleared; database fallback restored: %s",
+                            active_rds_text,
+                        )
 
             # Wait for a Postgres notification, up to one second.
             ready, _, _ = select.select([listener_conn], [], [], 1)
@@ -283,15 +338,24 @@ def main():
                     f_category = False
                     g_category = False
                     notification = listener_conn.notifies.pop(0)
-                    current_song_text, current_song_category = process_notification(
+                    database_song_text, current_song_category = process_notification(
                         listener_conn,
                         notification,
                     )
 
-                    if not current_song_text:
+                    if not database_song_text:
                         logging.warning(
                             "No RDS text resolved for playback payload=%r",
                             notification.payload,
+                        )
+                        continue
+
+                    if file_override_text:
+                        logging.info(
+                            "Database notification retained as fallback but not sent because "
+                            "CurrentSong override is active: database=%r override=%r",
+                            database_song_text,
+                            file_override_text,
                         )
                         continue
 
@@ -315,13 +379,14 @@ def main():
                                 g_category = True
                     except:
                         current_song_category = None
+                    active_rds_text = database_song_text
                     rotation_epoch = time.monotonic()
                     force_send_song_now = True
                     logging.info("Song category: %s", current_song_category)
-                    logging.info("Resolved display text: %s", current_song_text)
-                    if current_song_text:
+                    logging.info("Resolved display text: %s", active_rds_text)
+                    if active_rds_text:
                         if force_send_song_now:
-                            text_to_send = current_song_text
+                            text_to_send = active_rds_text
                             force_send_song_now = False
                         if that_80s_show:
                             PROGRAM_TEXT = "That 80s Show"
@@ -329,7 +394,7 @@ def main():
                             slot = int(elapsed // ROTATE_SECONDS)
 
                             if slot % 2 == 0:
-                                text_to_send = current_song_text
+                                text_to_send = active_rds_text
                             elif text_to_send is None:
                                 text_to_send = PROGRAM_TEXT
                             else:
@@ -340,7 +405,7 @@ def main():
                         #     slot = int(elapsed // ROTATE_SECONDS)
 
                         #     if slot % 2 == 0:
-                        #         text_to_send = current_song_text
+                        #         text_to_send = active_rds_text
                         #     else:
                         #         text_to_send = PROGRAM_TEXT
 
@@ -350,7 +415,7 @@ def main():
                         #     slot = int(elapsed // ROTATE_SECONDS)
 
                         #     if slot % 2 == 0:
-                        #         text_to_send = current_song_text
+                        #         text_to_send = active_rds_text
                         #     else:
                         #         text_to_send = PROGRAM_TEXT
 
@@ -360,7 +425,7 @@ def main():
                         #     slot = int(elapsed // ROTATE_SECONDS)
 
                         #     if slot % 2 == 0:
-                        #         text_to_send = current_song_text
+                        #         text_to_send = active_rds_text
                         #     else:
                         #         text_to_send = PROGRAM_TEXT
 
