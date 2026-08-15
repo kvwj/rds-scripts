@@ -1,28 +1,21 @@
-$portName = "COM3"
-$baudRate = 9600
-$parity   = [System.IO.Ports.Parity]::None
-$dataBits = 8
-$stopBits = [System.IO.Ports.StopBits]::One
-
-$port = New-Object System.IO.Ports.SerialPort(
-    $portName, $baudRate, $parity, $dataBits, $stopBits
+$port = [System.IO.Ports.SerialPort]::new(
+    "COM3", 9600,
+    [System.IO.Ports.Parity]::None,
+    8,
+    [System.IO.Ports.StopBits]::One
 )
 
 try {
-    Write-Host "Opening connection to $portName..."
     $port.Open()
-    Start-Sleep -Milliseconds 250
+    Start-Sleep -Milliseconds 300
 
-    Write-Host "Opening relay channel 1..."
-    $cmdOpen = [byte[]](0x55, 0x56, 0x00, 0x00, 0x00, 0x01, 0x01, 0xAD)
-    $port.Write($cmdOpen, 0, $cmdOpen.Length)
-}
-catch {
-    Write-Error "Failed to communicate with relay card: $_"
+    $open = [byte[]](0x55,0x56,0x00,0x00,0x00,0x01,0x01,0xAD)
+    $close = [byte[]](0x55,0x56,0x00,0x00,0x00,0x01,0x02,0xAE)
+
+    $port.Write($open, 0, $open.Length)
+    Start-Sleep -Seconds 2
+    $port.Write($close, 0, $close.Length)
 }
 finally {
-    if ($port -and $port.IsOpen) {
-        $port.Close()
-        Write-Host "Serial port closed safely."
-    }
+    if ($port.IsOpen) { $port.Close() }
 }
