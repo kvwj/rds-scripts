@@ -243,6 +243,10 @@ def main():
     active_rds_text = None
     last_sent_text = None
 
+    rotation_enabled = False
+    rotation_program_text = None
+    next_rotation_at = None
+
     latest_id = None
     last_file_mtime = None
 
@@ -382,60 +386,45 @@ def main():
                     active_rds_text = database_song_text
                     rotation_epoch = time.monotonic()
                     force_send_song_now = True
+                    rotation_enabled = that_80s_show
+                    rotation_program_text = "That 80s Show" if that_80s_show else None
+                    next_rotation_at = rotation_epoch + ROTATE_SECONDS
                     logging.info("Song category: %s", current_song_category)
                     logging.info("Resolved display text: %s", active_rds_text)
                     if active_rds_text:
-                        if force_send_song_now:
-                            text_to_send = active_rds_text
-                            force_send_song_now = False
-                        if that_80s_show:
-                            PROGRAM_TEXT = "That 80s Show"
-                            elapsed = time.monotonic() - rotation_epoch
-                            slot = int(elapsed // ROTATE_SECONDS)
-
-                            if slot % 2 == 0:
-                                text_to_send = active_rds_text
-                            elif text_to_send is None:
-                                text_to_send = PROGRAM_TEXT
-                            else:
-                                text_to_send = PROGRAM_TEXT
-                        # if a_category:
-                        #     PROGRAM_TEXT = "A Power Oldie on KVWJ"
-                        #     elapsed = time.monotonic() - rotation_epoch
-                        #     slot = int(elapsed // ROTATE_SECONDS)
-
-                        #     if slot % 2 == 0:
-                        #         text_to_send = active_rds_text
-                        #     else:
-                        #         text_to_send = PROGRAM_TEXT
-
-                        # if f_category:
-                        #     PROGRAM_TEXT = "An Image Track on KVWJ"
-                        #     elapsed = time.monotonic() - rotation_epoch
-                        #     slot = int(elapsed // ROTATE_SECONDS)
-
-                        #     if slot % 2 == 0:
-                        #         text_to_send = active_rds_text
-                        #     else:
-                        #         text_to_send = PROGRAM_TEXT
-
-                        # if g_category:
-                        #     PROGRAM_TEXT = "A Golden Oldie on KVWJ"
-                        #     elapsed = time.monotonic() - rotation_epoch
-                        #     slot = int(elapsed // ROTATE_SECONDS)
-
-                        #     if slot % 2 == 0:
-                        #         text_to_send = active_rds_text
-                        #     else:
-                        #         text_to_send = PROGRAM_TEXT
-
-                        # text_to_send = safe_trim(text_to_send)
+                        text_to_send = active_rds_text
 
                         if text_to_send != last_sent_text:
                             send_rds_text(text_to_send)
                             write_now_playing(text_to_send)
                             last_sent_text = text_to_send
+
                             logging.info("Sent to RDS: %s", text_to_send)
+
+
+            if (
+                rotation_enabled
+                and rotation_program_text
+                and next_rotation_at is not None
+                and not file_override_text
+                and time.monotonic() >= next_rotation_at
+            ):
+                if last_sent_text == active_rds_text:
+                    text_to_send = rotation_program_text
+                else:
+                    text_to_send = active_rds_text
+
+                if text_to_send != last_sent_text:
+                    send_rds_text(text_to_send)
+                    write_now_playing(text_to_send)
+                    last_sent_text = text_to_send
+
+                    logging.info(
+                        "Rotated RDS text: %s",
+                        text_to_send,
+                    )
+
+                next_rotation_at = time.monotonic() + ROTATE_SECONDS
 
     except KeyboardInterrupt:
         logging.info("Exiting on keyboard interrupt")
