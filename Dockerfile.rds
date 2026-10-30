@@ -8,7 +8,6 @@ ENV DB_PASSWORD='password'
 ENV RDS_HOST='192.168.0.108'
 ENV RDS_PORT=7005
 ENV ROTATE_SECONDS=10
-ENV CURRENT_SONG_FILE='/path/to/file'
 
 # copy source and install dependencies
 RUN apt update && apt -y install cifs-utils

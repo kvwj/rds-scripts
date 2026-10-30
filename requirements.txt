@@ -1,3 +1,0 @@
-waitress
-flask
-openai
