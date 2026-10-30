@@ -1,0 +1,26 @@
+FROM python:3.14-slim
+
+ENV MAX_LEN=64
+ENV DB_HOST='127.0.0.1'
+ENV DB_NAME='postgres'
+ENV DB_USER='postgres'
+ENV DB_PASSWORD='password'
+ENV RDS_HOST='192.168.0.108'
+ENV RDS_PORT=7005
+ENV ROTATE_SECONDS=10
+ENV CURRENT_SONG_FILE='/path/to/file'
+
+# copy source and install dependencies
+RUN apt update && apt -y install cifs-utils
+RUN mkdir -p /opt/app
+RUN mkdir -p /opt/app/rds
+COPY requirements.txt.rds /opt/app/rds/requirements.txt
+COPY zara_songname_to_rds.py /opt/app/rds
+COPY start-rds.sh /opt/app/rds
+WORKDIR /opt/app/rds
+RUN pip install --no-cache-dir -r requirements.txt
+
+ENV TIMEZONE="America/Denver"
+RUN cp /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+
+CMD ["bash", "start-rds.sh"]

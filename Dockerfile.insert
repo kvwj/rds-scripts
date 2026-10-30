@@ -1,0 +1,17 @@
+FROM python:3.14-slim
+
+# copy source and install dependencies
+RUN apt update && apt -y install cifs-utils
+RUN mkdir -p /opt/app
+RUN mkdir -p /opt/app/kvwjlogs
+COPY requirements.txt.insert /opt/app/kvwjlogs/requirements.txt
+#COPY insert_files_into_db.py /opt/app/kvwjlogs
+COPY insert_playback_events.py /opt/app/kvwjlogs
+COPY start-app.sh /opt/app/kvwjlogs
+WORKDIR /opt/app/kvwjlogs
+RUN pip install --no-cache-dir -r requirements.txt
+
+ENV TIMEZONE="America/Denver"
+RUN cp /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+
+CMD ["bash", "start-app.sh"]
