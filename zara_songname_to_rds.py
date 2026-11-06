@@ -72,6 +72,38 @@ def connect_db():
     conn.autocommit = True
     return conn
 
+
+def read_rds_display_state(conn) -> tuple[str, str | None, str]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT current_text, override_text, override_lifetime
+            FROM rds_display_state
+            WHERE id = 1
+        """)
+        row = cur.fetchone()
+
+    return row or ("", None, "until_cleared")
+
+
+def record_rds_display_text(conn, text: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO rds_display_state
+                (id, current_text, override_lifetime, updated_at)
+            VALUES (1, %s, 'until_cleared', CURRENT_TIMESTAMP)
+            ON CONFLICT (id) DO UPDATE
+            SET current_text = EXCLUDED.current_text,
+                updated_at = CURRENT_TIMESTAMP
+        """, (safe_trim(text),))
+
+
+def send_and_record_rds_text(conn, text: str) -> None:
+    text = safe_trim(text)
+    send_rds_text(text)
+    record_rds_display_text(conn, text)
+    write_now_playing(text)
+
+
 def read_stable_file(path: str, checks: int = 2, delay: float = 0.2) -> str | None:
     previous = None
     stable_count = 0
@@ -242,6 +274,7 @@ def main():
     file_override_text = None
     active_rds_text = None
     last_sent_text = None
+    last_manual_override_text = None
 
     rotation_enabled = False
     rotation_program_text = None
@@ -267,12 +300,17 @@ def main():
                 listener_conn,
                 latest_id,
             )
+            active_rds_text = database_song_text
 
     try:
         while True:
             if listener_conn is None or listener_conn.closed:
                 listener_conn = connect_listener()
-                
+
+            _, manual_override_text, manual_override_lifetime = (
+                read_rds_display_state(conn)
+            )
+
             file_was_changed, last_file_mtime = file_changed(
                 CURRENT_SONG_FILE,
                 last_file_mtime,
@@ -295,9 +333,11 @@ def main():
                         file_override_text,
                     )
 
-                    if file_override_text != last_sent_text:
-                        send_rds_text(file_override_text)
-                        write_now_playing(file_override_text)
+                    if (
+                        not manual_override_text
+                        and file_override_text != last_sent_text
+                    ):
+                        send_and_record_rds_text(conn, file_override_text)
                         last_sent_text = file_override_text
 
                         logging.info(
@@ -342,6 +382,9 @@ def main():
                     f_category = False
                     g_category = False
                     notification = listener_conn.notifies.pop(0)
+                    _, manual_override_text, manual_override_lifetime = (
+                        read_rds_display_state(conn)
+                    )
                     database_song_text, current_song_category = process_notification(
                         listener_conn,
                         notification,
@@ -391,22 +434,70 @@ def main():
                     next_rotation_at = rotation_epoch + ROTATE_SECONDS
                     logging.info("Song category: %s", current_song_category)
                     logging.info("Resolved display text: %s", active_rds_text)
+
+                    if (
+                        manual_override_text
+                        and manual_override_lifetime == "until_next_song"
+                    ):
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                UPDATE rds_display_state
+                                SET override_text = NULL,
+                                    override_lifetime = 'until_cleared',
+                                    updated_at = CURRENT_TIMESTAMP
+                                WHERE id = 1
+                            """)
+                        manual_override_text = None
+                        last_manual_override_text = None
+
+                    if file_override_text:
+                        logging.info(
+                            "Database RDS text not sent because special "
+                            "CurrentSong override is active: database=%r override=%r",
+                            database_song_text,
+                            file_override_text,
+                        )
+                        continue
+
+                    if manual_override_text:
+                        logging.info(
+                            "Database RDS text not sent because manual "
+                            "override is active: database=%r override=%r",
+                            database_song_text,
+                            manual_override_text,
+                        )
+                        continue
+
                     if active_rds_text:
                         text_to_send = active_rds_text
 
                         if text_to_send != last_sent_text:
-                            send_rds_text(text_to_send)
-                            write_now_playing(text_to_send)
+                            send_and_record_rds_text(conn, text_to_send)
                             last_sent_text = text_to_send
 
                             logging.info("Sent to RDS: %s", text_to_send)
 
+            if manual_override_text:
+                last_manual_override_text = manual_override_text
+                if manual_override_text != last_sent_text:
+                    send_and_record_rds_text(conn, manual_override_text)
+                    last_sent_text = manual_override_text
+                    logging.info("Sent manual RDS override: %s", manual_override_text)
+            elif last_manual_override_text is not None:
+                if last_sent_text == last_manual_override_text:
+                    restored_text = file_override_text or active_rds_text
+                    if restored_text and restored_text != last_sent_text:
+                        send_and_record_rds_text(conn, restored_text)
+                        last_sent_text = restored_text
+                        logging.info("Restored RDS display: %s", restored_text)
+                last_manual_override_text = None
 
             if (
                 rotation_enabled
                 and rotation_program_text
                 and next_rotation_at is not None
                 and not file_override_text
+                and not manual_override_text
                 and time.monotonic() >= next_rotation_at
             ):
                 if last_sent_text == active_rds_text:
@@ -415,8 +506,7 @@ def main():
                     text_to_send = active_rds_text
 
                 if text_to_send != last_sent_text:
-                    send_rds_text(text_to_send)
-                    write_now_playing(text_to_send)
+                    send_and_record_rds_text(conn, text_to_send)
                     last_sent_text = text_to_send
 
                     logging.info(
