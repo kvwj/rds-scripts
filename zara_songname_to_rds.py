@@ -355,15 +355,15 @@ def main():
 
                     file_override_text = None
 
-                    if database_song_text and database_song_text != last_sent_text:
-                        send_rds_text(database_song_text)
-                        write_now_playing(database_song_text)
-                        last_sent_text = database_song_text
+                    # if database_song_text and database_song_text != last_sent_text:
+                    #     send_rds_text(database_song_text)
+                    #     write_now_playing(database_song_text)
+                    #     last_sent_text = database_song_text
 
-                        logging.info(
-                            "Restored database RDS text: %s",
-                            database_song_text,
-                        )
+                    #     logging.info(
+                    #         "Restored database RDS text: %s",
+                    #         database_song_text,
+                    #     )
 
             # Wait for a Postgres notification, up to one second.
             ready, _, _ = select.select([listener_conn], [], [], 1)
