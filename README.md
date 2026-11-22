@@ -29,9 +29,12 @@ existing year. Sunday recordings retain their artist-less identity.
 Each log line is imported in one transaction: catalog creation or updates,
 playback insertion, and category capture commit together. Duplicate events
 are skipped before updating the catalog. Older events cannot revert the category
-of a track with a newer recorded playback. Ambiguous track identities, filename
-uniqueness conflicts, and a different song at the same date/time are reported
-instead of guessing or merging records. An advisory transaction lock serializes
+of a track with a newer recorded playback. When duplicate catalog rows match a
+song (for example, two artist-less Sunday tracks with the same title), the
+importer logs a warning and uses the row with the same filename, then the same
+category, then the exact title, then the lowest id. Filename uniqueness
+conflicts and a different song at the same date/time are reported instead of
+merging records. An advisory transaction lock serializes
 instances of this importer; other catalog writers must still respect database
 constraints.
 
@@ -44,8 +47,9 @@ Database errors and import conflicts roll back and send the existing
 database-error notification and, when configured, email (`TO_EMAIL`,
 `FROM_EMAIL`, `GMAIL_USERNAME`, `GMAIL_APP_PASSWORD`). Malformed log entries
 and decoding errors are logged without email, skipped, and retried on restart.
-Database errors and import conflicts stop reading at the failed line; a later
-file event or restart retries it. Partial lines are held until their terminating
+Database connection errors stop reading at the failed line; a later file event
+or restart retries it. Data errors and import conflicts are reported once,
+skipped, and processing continues with the next line. Partial lines are held until their terminating
 newline arrives.
 
 ## Finding 80s copies to remove

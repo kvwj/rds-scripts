@@ -105,10 +105,13 @@ def parse_song(line):
 
 def lookup_or_insert(cursor, table, column, value, *, insensitive=False):
     condition = f"UPPER(BTRIM({column})) = UPPER(BTRIM(%s))" if insensitive else f"{column} = %s"
-    cursor.execute(f"SELECT id FROM {table} WHERE {condition}", (value,))
+    cursor.execute(
+        f"SELECT id FROM {table} WHERE {condition} ORDER BY COALESCE({column} = %s, FALSE) DESC, id",
+        (value, value),
+    )
     rows = cursor.fetchall()
     if len(rows) > 1:
-        raise ValueError(f"Ambiguous {table} entry: {value}")
+        logging.warning("Multiple %s entries match %r; using id %s.", table, value, rows[0][0])
     if rows:
         return rows[0][0]
     cursor.execute(f"INSERT INTO {table} ({column}) VALUES (%s) RETURNING id", (value,))
@@ -146,11 +149,17 @@ def insert_song_playback(connection, song, date):
                 SELECT id, categoryid FROM tracks
                 WHERE UPPER(BTRIM(track_name)) = UPPER(BTRIM(%s))
                   AND artistid IS NOT DISTINCT FROM %s
+                ORDER BY COALESCE(filename = %s, FALSE) DESC,
+                    COALESCE(categoryid = %s, FALSE) DESC,
+                    COALESCE(track_name = %s, FALSE) DESC, id
                 FOR UPDATE
-            """, (title, artist_id))
+            """, (title, artist_id, filename, category_id, title))
             rows = cursor.fetchall()
             if len(rows) > 1:
-                raise ValueError(f"Ambiguous track identity: {artist} - {title}")
+                # Duplicate catalog rows exist; pick the closest match so imports keep flowing.
+                logging.warning(
+                    "Multiple tracks match %s - %s; using track %s.", artist, title, rows[0][0],
+                )
             if rows:
                 track_id, old_category_id = rows[0]
                 cursor.execute("""
@@ -254,10 +263,18 @@ class LogHandler(FileSystemEventHandler):
                                 filepath, line_offset, error,
                             )
                             continue
-                        except (psycopg2.Error, ValueError) as error:
+                        except (psycopg2.OperationalError, psycopg2.InterfaceError) as error:
                             report_database_error(error)
                             log.seek(line_offset)
                             break
+                        except (psycopg2.Error, ValueError) as error:
+                            # Data problems will fail the same way on retry, so skip the line.
+                            report_database_error(error)
+                            logging.error(
+                                "Skipping playback log entry in %s at byte offset %s.",
+                                filepath, line_offset,
+                            )
+                            continue
                     self.file_state[filepath] = {"inode": stat.st_ino, "offset": log.tell()}
             except FileNotFoundError:
                 logging.warning("Log disappeared while reading: %s", filepath)

@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import psycopg2
+
 from insert_playback_events import LogHandler, insert_song_playback, parse_song
 
 
@@ -135,18 +137,25 @@ class PlaybackImportTests(unittest.TestCase):
         self.assertEqual(self.database.execute("SELECT COUNT(*) FROM playback_category").fetchone(), (0,))
         self.assertEqual(self.database.execute("SELECT COUNT(*) FROM categories").fetchone(), (1,))
 
-    def test_ambiguous_identity_and_conflicting_event_fail_without_inserting(self):
+    def test_conflicting_event_fails_without_inserting(self):
         self.play("A", "01:00:00")
         with self.assertRaisesRegex(ValueError, "Different song already recorded"):
             insert_song_playback(
                 self.connection, ("Other", "Artist", None, "B", "Other.mp3", "01:00:00"), self.date,
             )
-        self.database.execute("INSERT INTO tracks (track_name,artistid,categoryid) VALUES (' TITLE ',1,1)")
-        self.database.commit()
-        with self.assertRaisesRegex(ValueError, "Ambiguous track identity"):
-            self.play("B", "02:00:00")
         self.assertEqual(self.database.execute("SELECT COUNT(*) FROM playback").fetchone(), (1,))
-        self.assertEqual(self.database.execute("SELECT COUNT(*) FROM categories").fetchone(), (1,))
+
+    def test_duplicate_artistless_tracks_use_closest_match_instead_of_failing(self):
+        self.database.executescript("""
+            INSERT INTO categories (id, category) VALUES (1, 'Sunday'), (2, 'Other');
+            INSERT INTO tracks (id, track_name, categoryid) VALUES
+                (1, 'I am a child of God', 2), (2, 'I Am A Child Of God', 1), (3, 'I Am A Child Of God', 2);
+        """)
+        insert_song_playback(self.connection, (
+            "I Am A Child Of God", None, None, "Sunday", "I Am A Child Of God.mp3", "02:00:00",
+        ), self.date)
+        self.assertEqual(self.database.execute("SELECT trackid FROM playback").fetchall(), [(2,)])
+        self.assertEqual(self.database.execute("SELECT COUNT(*) FROM tracks").fetchone(), (3,))
 
     def test_case_and_whitespace_identity_reuses_track(self):
         self.play("A", "01:00:00")
@@ -201,7 +210,7 @@ class PlaybackParsingTests(unittest.TestCase):
             path = Path(folder) / f"{datetime.now():%Y-%m-%d}.log"
             path.write_text("first\npartial")
             handler = LogHandler(None)
-            with patch.object(handler, "parse_and_insert", side_effect=ValueError("offline")), patch(
+            with patch.object(handler, "parse_and_insert", side_effect=psycopg2.OperationalError("offline")), patch(
                 "insert_playback_events.report_database_error",
             ) as notify:
                 handler.process_log_file(str(path))
@@ -215,6 +224,19 @@ class PlaybackParsingTests(unittest.TestCase):
             with patch.object(handler, "parse_and_insert") as parse:
                 handler.process_log_file(str(path))
             self.assertEqual(parse.call_args.args[0], "partial\n")
+
+    def test_data_error_is_reported_and_later_lines_continue(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / f"{datetime.now():%Y-%m-%d}.log"
+            path.write_text("bad\ngood\n")
+            handler = LogHandler(None)
+            with patch.object(
+                handler, "parse_and_insert", side_effect=[ValueError("conflict"), True],
+            ) as parse, patch("insert_playback_events.report_database_error") as notify:
+                handler.process_log_file(str(path))
+            notify.assert_called_once()
+            self.assertEqual(parse.call_count, 2)
+            self.assertEqual(handler.file_state[str(path)]["offset"], path.stat().st_size)
 
     def test_windows_encoded_logs_preserve_non_ascii_and_partial_lines(self):
         root = r"C:\ye olde new gold\playback\clockwheel rotation"
