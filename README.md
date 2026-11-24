@@ -7,6 +7,10 @@
 `DATABASE_NAME`, `DATABASE_USER`, `DATABASE_PASSWORD`, `DATABASE_HOST`, and
 `DATABASE_PORT`.
 
+The importer accepts `.mp3` and `.wav` song files (case-insensitive). Restarting
+after an update replays the latest 29 days, including previously skipped WAV
+entries; existing playback events are skipped.
+
 Logs default to UTF-8. If Zara writes Windows-1252 logs, set
 `ZARA_LOG_ENCODING=cp1252` in the importer environment and restart it. Use the
 actual encoding configured on the Zara machine: a decoding error alone does

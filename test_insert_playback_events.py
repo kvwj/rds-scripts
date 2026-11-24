@@ -186,6 +186,32 @@ class PlaybackImportTests(unittest.TestCase):
             "SELECT category FROM playback_category ORDER BY playback_id",
         ).fetchall(), [("Sunday",), ("Sunday archive",)])
 
+    def test_log_replay_imports_skipped_wav_without_duplicating_existing_plays(self):
+        date = datetime.now().strftime("%Y-%m-%d")
+        root = r"C:\Users\KVWJ\Desktop\pls\Night only"
+        wav = root + r"\Breakup Song - Greg Kihn Band - 1981.wav"
+        mp3 = root + r"\Title - Artist - 1985.mp3"
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / f"{date}.log"
+            path.write_text(f"01:00:00\t{wav}\n02:00:00\t{mp3}\n")
+            insert_song_playback(
+                self.connection,
+                ("Title", "Artist", 1985, "Night only", "Title - Artist - 1985.mp3", "02:00:00"),
+                date,
+            )
+            handler = LogHandler(self.connection)
+            handler.process_log_file(str(path), read_existing=True)
+            handler.process_log_file(str(path), read_existing=True)
+        self.assertEqual(self.database.execute("""
+            SELECT t.track_name, a.artist_name, y.year, t.filename, pc.category, p.timestamp
+            FROM playback p JOIN tracks t ON p.trackid = t.id
+            JOIN artists a ON t.artistid = a.id JOIN years y ON t.yearid = y.id
+            JOIN playback_category pc ON pc.playback_id = p.id ORDER BY p.timestamp
+        """).fetchall(), [
+            ("Breakup Song", "Greg Kihn Band", 1981, "Breakup Song - Greg Kihn Band - 1981.wav", "Night only", "01:00:00"),
+            ("Title", "Artist", 1985, "Title - Artist - 1985.mp3", "Night only", "02:00:00"),
+        ])
+
 
 class PlaybackParsingTests(unittest.TestCase):
     def test_regular_eighties_and_sunday_paths(self):
@@ -199,6 +225,17 @@ class PlaybackParsingTests(unittest.TestCase):
                 self.assertEqual(parse_song("01:02:03\t" + root + relative)[:4], expected)
         self.assertIsNone(parse_song("01:02:03\tNot a music entry"))
         self.assertIsNone(parse_song("01:02:03\t" + root + r"\Special Liners\Station.mp3"))
+
+    def test_wav_formats_and_extension_case(self):
+        root = r"C:\ye olde new gold\playback\clockwheel rotation"
+        for relative, expected in (
+            (r"\A\Title - Artist - 1985.WAV", ("Title", "Artist", 1985, "A", "Title - Artist - 1985.WAV", "01:02:03")),
+            (r"\That 80s Show\80s Rock\Artist - Title.wav", ("Title", "Artist", None, "80s Rock", "Artist - Title.wav", "01:02:03")),
+            (r"\Sunday\Title.wav", ("Title", None, None, "Sunday", "Title.wav", "01:02:03")),
+        ):
+            with self.subTest(relative=relative):
+                self.assertEqual(parse_song("01:02:03\t" + root + relative), expected)
+        self.assertIsNone(parse_song("01:02:03\t" + root + r"\A\Title - Artist - 1985.txt"))
 
     def test_non_padded_timestamps_cannot_break_chronological_ordering(self):
         root = r"C:\ye olde new gold\playback\clockwheel rotation"

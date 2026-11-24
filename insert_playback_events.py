@@ -77,7 +77,7 @@ def parse_song(line):
     if "special liners" in relative.casefold() or len(parts) < 3:
         return None
     filename = parts[-1]
-    if PureWindowsPath(filename).suffix.casefold() != ".mp3":
+    if PureWindowsPath(filename).suffix.casefold() not in (".mp3", ".wav"):
         return None
     category = parts[-2].strip()
     stem = PureWindowsPath(filename).stem
